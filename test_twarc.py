@@ -3,8 +3,16 @@ import re
 import json
 import time
 import logging
+import pytest
+try:
+    from unittest.mock import patch, call, MagicMock  # Python 3
+except ImportError:
+    from mock import patch, call, MagicMock  # Python 2
 
-from twarc import Twarc
+from requests_oauthlib import OAuth1Session
+import requests
+
+import twarc
 
 """
 
@@ -18,17 +26,16 @@ You will need to have these environment variables set to run these tests:
 """
 
 logging.basicConfig(filename="test.log", level=logging.INFO)
+T = twarc.Twarc()
 
-consumer_key = os.environ.get('CONSUMER_KEY')
-consumer_secret = os.environ.get('CONSUMER_SECRET')
-access_token = os.environ.get('ACCESS_TOKEN')
-access_token_secret = os.environ.get('ACCESS_TOKEN_SECRET')
-t = Twarc(consumer_key, consumer_secret, access_token, access_token_secret)
+def test_version():
+    import setup
+    assert setup.__version__ == twarc.__version__
 
 
 def test_search():
     count = 0
-    for tweet in t.search('obama'):
+    for tweet in T.search('obama'):
         assert tweet['id_str']
         count += 1
         if count == 10:
@@ -36,24 +43,31 @@ def test_search():
     assert count == 10
 
 
+def test_search_max_pages():
+    tweets = list(T.search('obama', max_pages=1))
+    assert 0 < len(tweets) <= 100
+    tweets = list(T.search('obama', max_pages=2))
+    assert 100 < len(tweets) <= 200
+
+
 def test_since_id():
-    for tweet in t.search('obama'):
+    for tweet in T.search('obama'):
         id = tweet['id_str']
         break
     assert id
     time.sleep(5)
-    for tweet in t.search('obama', since_id=id):
+    for tweet in T.search('obama', since_id=id):
         assert tweet['id_str'] > id
 
 
 def test_max_id():
-    for tweet in t.search('obama'):
+    for tweet in T.search('obama'):
         id = tweet['id_str']
         break
     assert id
     time.sleep(5)
     count = 0
-    for tweet in t.search('obama', max_id=id):
+    for tweet in T.search('obama', max_id=id):
         count += 1
         assert tweet['id_str'] <= id
         if count > 100:
@@ -63,7 +77,7 @@ def test_max_id():
 def test_max_and_since_ids():
     max_id = since_id = None
     count = 0
-    for tweet in t.search('obama'):
+    for tweet in T.search('obama'):
         count += 1
         if not max_id:
             max_id = tweet['id_str']
@@ -71,7 +85,7 @@ def test_max_and_since_ids():
         if count > 500:
             break
     count = 0
-    for tweet in t.search('obama', max_id=max_id, since_id=since_id):
+    for tweet in T.search('obama', max_id=max_id, since_id=since_id):
         count += 1
         assert tweet['id_str'] <= max_id
         assert tweet['id_str'] > since_id
@@ -80,21 +94,46 @@ def test_max_and_since_ids():
 def test_paging():
     # pages are 100 tweets big so if we can get 500 paging is working
     count = 0
-    for tweet in t.search('obama'):
+    for tweet in T.search('obama'):
         count += 1
         if count == 500:
             break
     assert count == 500
 
 
+def test_geocode():
+    # look for tweets from New York ; the search radius is larger than NYC
+    # so hopefully we'll find one from New York in the first 100?
+    count = 0
+    found = False
+
+    for tweet in T.search(None, geocode='40.7484,-73.9857,1mi'):
+        if (tweet['place'] or {}).get('name') == 'Manhattan':
+            found = True
+            break
+        if count > 100:
+            break
+        count += 1
+
+    assert found
+
 def test_track():
-    tweet = next(t.filter(track="obama"))
+    tweet = next(T.filter(track="obama"))
     json_str = json.dumps(tweet)
 
     assert re.search('obama', json_str, re.IGNORECASE)
 
     # reconnect to close streaming connection for other tests
-    t.connect()
+    T.connect()
+
+
+def test_keepalive():
+    for event in T.filter(track="abcdefghiklmno", record_keepalive=True):
+        if event == 'keep-alive':
+            break
+
+    # reconnect to close streaming connection for other tests
+    T.connect()
 
 
 def test_follow():
@@ -112,7 +151,7 @@ def test_follow():
     ]
     found = False
 
-    for tweet in t.filter(follow=','.join(user_ids)):
+    for tweet in T.filter(follow=','.join(user_ids)):
         assert tweet['id_str']
         if tweet['user']['id_str'] in user_ids:
             found = True
@@ -126,13 +165,12 @@ def test_follow():
         break
 
     if not found:
-        print("couldn't find user in response")
-        print(json.dumps(tweet, indent=2))
+        logging.warn("couldn't find user in response: %s", json.dumps(tweet, indent=2))
 
     assert found
 
     # reconnect to close streaming connection for other tests
-    t.connect()
+    T.connect()
 
 
 def test_locations():
@@ -141,7 +179,7 @@ def test_locations():
     count = 0
     found = False
 
-    for tweet in t.filter(locations="-74,40,-73,41"):
+    for tweet in T.filter(locations="-74,40,-73,41"):
         if tweet['place']['name'] == 'Manhattan':
             found = True
             break
@@ -152,29 +190,132 @@ def test_locations():
     assert found
 
     # reconnect to close streaming connection for other tests
-    t.connect()
+    T.connect()
 
 
 def test_timeline_by_user_id():
     # looks for recent tweets and checks if tweets are of provided user_id
     user_id = "87818409"
 
-    for tweet in t.timeline(user_id=user_id):
+    for tweet in T.timeline(user_id=user_id):
         assert tweet['user']['id_str'] == user_id
 
-    # reconnect to close streaming connection for other tests
-    t.connect()
+    # Make sure that passing an int user_id behaves as expected. Issue #235
+    user_id = 87818409
+
+    all_tweets = list(T.timeline(user_id=user_id))
+    assert len(all_tweets)
+
+    for tweet in all_tweets:
+        assert tweet['user']['id'] == user_id
+
+
+def test_timeline_max_pages():
+    # looks for recent tweets and checks if tweets are of provided user_id
+    user_id = "87818409"
+
+    first_page = list(T.timeline(user_id=user_id, max_pages=1))
+    assert 0 < len(first_page) <= 200
+
+    all_pages = list(T.timeline(user_id=user_id))
+    assert len(all_pages) > len(first_page)
 
 
 def test_timeline_by_screen_name():
     # looks for recent tweets and checks if tweets are of provided screen_name
     screen_name = "guardian"
 
-    for tweet in t.timeline(screen_name=screen_name):
+    for tweet in T.timeline(screen_name=screen_name):
         assert tweet['user']['screen_name'].lower() == screen_name.lower()
 
-    # reconnect to close streaming connection for other tests
-    t.connect()
+
+def test_timeline_arg_handling():
+    # Confirm that only user_id *or* screen_name is valid for timeline
+    screen_name = "guardian"
+    user_id = "87818409"
+
+    with pytest.raises(ValueError):
+        for t in T.timeline(screen_name=None, user_id=None):
+            pass
+
+    with pytest.raises(ValueError):
+        for t in T.timeline(screen_name=screen_name, user_id=user_id):
+            pass
+
+
+def test_timeline_with_since_id():
+    count = 0
+    tweet_id = None
+    for tweet in T.timeline(screen_name='guardian'):
+        tweet_id = tweet['id_str']
+        count += 1
+        if count > 10:
+            break
+
+    tweets = list(T.timeline(screen_name='guardian', since_id=tweet_id))
+    assert len(tweets) == 10
+
+
+def test_trends_available():
+    # fetches all available trend regions and checks presence of likely member
+    trends = T.trends_available()
+    worldwide = [t for t in trends if t['placeType']['name'] == 'Supername']
+    assert worldwide[0]['name'] == 'Worldwide'
+
+
+def test_trends_place():
+    # fetches recent trends for Amsterdam, WOEID 727232
+    trends = T.trends_place(727232)
+    assert len(list(trends[0]['trends'])) > 0
+
+
+def test_trends_closest():
+    # fetches regions bounding the specified lat and lon
+    trends = T.trends_closest(38.883137, -76.990228)
+    assert len(list(trends)) > 0
+
+
+def test_trends_place_exclude():
+    # fetches recent trends for Amsterdam, WOEID 727232, sans hashtags
+    trends = T.trends_place(727232, exclude='hashtags')[0]['trends']
+    hashtag_trends = [t for t in trends if t['name'].startswith('#')]
+    assert len(hashtag_trends) == 0
+
+
+def test_follower_ids():
+    count = 0
+    for id in T.follower_ids('justinbieber'):
+        count += 1
+        if count == 10001:
+            break
+    assert count == 10001
+
+
+def test_follower_ids_with_user_id():
+    count = 0
+    for id in T.follower_ids(27260086):
+        count += 1
+        if count > 10001:
+            break
+    assert count > 10001
+
+
+def test_friend_ids():
+    count = 0
+    for id in T.friend_ids('justinbieber'):
+        count += 1
+        if count == 10001:
+            break
+    assert count == 10001
+
+
+def test_friend_ids_with_user_id():
+    count = 0
+    for id in T.friend_ids(27260086):
+        count += 1
+        if count > 10001:
+            break
+    assert count > 10001
 
 
 def test_user_lookup_by_user_id():
@@ -196,13 +337,10 @@ def test_user_lookup_by_user_id():
 
     uids = []
 
-    for user in t.user_lookup(user_ids=user_ids):
+    for user in T.user_lookup(ids=user_ids):
         uids.append(user['id_str'])
 
     assert set(user_ids) == set(uids)
-
-    # reconnect to close streaming connection for other tests
-    t.connect()
 
 
 def test_user_lookup_by_screen_name():
@@ -213,13 +351,25 @@ def test_user_lookup_by_screen_name():
 
     names = []
 
-    for user in t.user_lookup(screen_names=screen_names):
+    for user in T.user_lookup(ids=screen_names, id_type="screen_name"):
         names.append(user['screen_name'].lower())
 
     assert set(names) == set(map(lambda x: x.lower(), screen_names))
 
-    # reconnect to close streaming connection for other tests
-    t.connect()
+
+def test_tweet():
+    t = T.tweet("20")
+    assert t['full_text'] == 'just setting up my twttr'
+
+def test_dehydrate():
+    tweets = [
+        '{"text": "test tweet 1", "id_str": "800000000000000000"}',
+        '{"text": "test tweet 2", "id_str": "800000000000000001"}',
+    ]
+    ids = list(T.dehydrate(iter(tweets)))
+    assert len(ids) == 2
+    assert "800000000000000000" in ids
+    assert "800000000000000001" in ids
 
 
 def test_hydrate():
@@ -289,7 +439,142 @@ def test_hydrate():
         "618602288781860864"
     ]
     count = 0
-    for tweet in t.hydrate(iter(ids)):
+    for tweet in T.hydrate(iter(ids)):
         assert tweet['id_str']
         count += 1
     assert count > 100  # may need to adjust as these might get deleted
+
+
+@patch("twarc.client.OAuth1Session", autospec=True)
+def test_connection_error_get(oauth1session_class):
+    mock_oauth1session = MagicMock(spec=OAuth1Session)
+    oauth1session_class.return_value = mock_oauth1session
+    mock_oauth1session.get.side_effect = requests.exceptions.ConnectionError
+    t = twarc.Twarc("consumer_key", "consumer_secret", "access_token",
+                    "access_token_secret", connection_errors=3,
+                    validate_keys=False)
+    with pytest.raises(requests.exceptions.ConnectionError):
+        t.get("https://api.twitter.com")
+
+    assert 3 == mock_oauth1session.get.call_count
+
+
+@patch("twarc.client.OAuth1Session", autospec=True)
+def test_connection_error_post(oauth1session_class):
+    mock_oauth1session = MagicMock(spec=OAuth1Session)
+    oauth1session_class.return_value = mock_oauth1session
+    mock_oauth1session.post.side_effect = requests.exceptions.ConnectionError
+    t = twarc.Twarc("consumer_key", "consumer_secret", "access_token",
+                    "access_token_secret", connection_errors=2,
+                    validate_keys=False)
+    with pytest.raises(requests.exceptions.ConnectionError):
+        t.post("https://api.twitter.com")
+
+    assert 2 == mock_oauth1session.post.call_count
+
+
+def test_http_error_sample():
+    t = twarc.Twarc("consumer_key", "consumer_secret", "access_token",
+                    "access_token_secret", http_errors=2, validate_keys=False)
+    with pytest.raises(requests.exceptions.HTTPError):
+        next(t.sample())
+
+
+def test_http_error_filter():
+    t = twarc.Twarc("consumer_key", "consumer_secret", "access_token",
+                    "access_token_secret", http_errors=3, validate_keys=False)
+    with pytest.raises(requests.exceptions.HTTPError):
+        next(t.filter(track="test"))
+
+
+def test_http_error_timeline():
+    t = twarc.Twarc("consumer_key", "consumer_secret", "access_token",
+                    "access_token_secret", http_errors=4, validate_keys=False)
+    with pytest.raises(requests.exceptions.HTTPError):
+        next(t.timeline(user_id="test"))
+
+
+def test_retweets():
+    assert len(list(T.retweets('795972820413140992'))) == 2
+
+
+def test_replies():
+    # this test will look at trending hashtags, and do a search
+    # to find a popular tweet that uses it, and then makes a
+    # big assumption that someone must have responded to the tweet
+
+    # get the top hashtag that is trending
+    trends = T.trends_place("1")[0]["trends"]
+    trends.sort(key=lambda a: a['tweet_volume'] or 0, reverse=True)
+    top_hashtag = trends[0]["name"].strip('#')
+
+    logging.info("top hashtag %s" % top_hashtag)
+    tries = 0
+    for top_tweet in T.search(top_hashtag, result_type="popular"):
+        logging.info("testing %s" % top_tweet['id_str'])
+
+        # get replies to the top tweet
+        replies = T.replies(top_tweet)
+
+        # the first tweet should be the base tweet, or the tweet that
+        # we are looking for replies to
+        me = next(replies)
+        assert me['id_str'] == top_tweet['id_str']
+
+        try:
+            reply = next(replies)
+            assert reply['in_reply_to_status_id_str'] == top_tweet['id_str']
+            break
+
+        except StopIteration:
+            pass # didn't find a reply
+
+        tries += 1
+        if tries > 10:
+            break
+
+
+def test_lists_members():
+    slug = 'bots'
+    screen_name = 'edsu'
+    members = list(T.list_members(slug=slug, owner_screen_name=screen_name))
+    assert len(members) > 0
+    assert members[0]['screen_name']
+
+
+def test_lists_members_owner_id():
+    slug = 'bots'
+    owner_id = '14331818'
+    members = list(T.list_members(slug=slug, owner_id=owner_id))
+    assert len(members) > 0
+    assert members[0]['screen_name']
+
+
+def test_lists_list_id():
+    members = list(T.list_members(list_id='197880909'))
+    assert len(members) > 0
+    assert members[0]['screen_name']
+
+
+def test_extended_compat():
+    t_compat = twarc.Twarc(tweet_mode="compat")
+
+    assert 'full_text' in next(T.search('obama'))
+    assert 'text' in next(t_compat.search("obama"))
+
+    assert 'full_text' in next(T.timeline(screen_name="BarackObama"))
+    assert 'text' in next(t_compat.timeline(screen_name="BarackObama"))
+
+
+def test_invalid_credentials():
+    old_consumer_key = T.consumer_key
+    T.consumer_key = None
+
+    with pytest.raises(RuntimeError):
+        T.validate_keys()
+
+    T.consumer_key = 'Definitely not a valid key'
+    with pytest.raises(RuntimeError):
+        T.validate_keys()
+
+    T.consumer_key = old_consumer_key
