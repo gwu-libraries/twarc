@@ -146,8 +146,7 @@ def test_follow():
         "23484039",    # WSJbreakingnews
         "384438102",   # ABCNewsLive
         "15108702",    # ReutersLive
-        "87416722",    # SkyNewsBreak
-        "2673523800",  # AJELive
+        "87416722"     # SkyNewsBreak
     ]
     found = False
 
@@ -228,15 +227,17 @@ def test_timeline_by_screen_name():
     for tweet in T.timeline(screen_name=screen_name):
         assert tweet['user']['screen_name'].lower() == screen_name.lower()
 
+def test_home_timeline():
+    found = False
+    for tweet in T.timeline():
+        found = True
+        break
+    assert found
 
 def test_timeline_arg_handling():
     # Confirm that only user_id *or* screen_name is valid for timeline
     screen_name = "guardian"
     user_id = "87818409"
-
-    with pytest.raises(ValueError):
-        for t in T.timeline(screen_name=None, user_id=None):
-            pass
 
     with pytest.raises(ValueError):
         for t in T.timeline(screen_name=screen_name, user_id=user_id):
@@ -331,8 +332,7 @@ def test_user_lookup_by_user_id():
         '23484039',    # WSJbreakingnews
         '384438102',   # ABCNewsLive
         '15108702',    # ReutersLive
-        '87416722',    # SkyNewsBreak
-        '2673523800',  # AJELive
+        '87416722'    # SkyNewsBreak
     ]
 
     uids = []
@@ -347,7 +347,7 @@ def test_user_lookup_by_screen_name():
     # looks for the user with given screen_names
     screen_names = ["guardian", "nytimes", "cnnbrk", "BBCBreaking",
                     "washingtonpost", "BuzzFeedNews", "WSJbreakingnews",
-                    "ABCNewsLive", "ReutersLive", "SkyNewsBreak", "AJELive"]
+                    "ABCNewsLive", "ReutersLive", "SkyNewsBreak"]
 
     names = []
 
@@ -487,15 +487,22 @@ def test_http_error_filter():
         next(t.filter(track="test"))
 
 
-def test_http_error_timeline():
-    t = twarc.Twarc("consumer_key", "consumer_secret", "access_token",
-                    "access_token_secret", http_errors=4, validate_keys=False)
-    with pytest.raises(requests.exceptions.HTTPError):
-        next(t.timeline(user_id="test"))
-
-
 def test_retweets():
     assert len(list(T.retweets('795972820413140992'))) == 2
+
+
+def test_oembed():
+    t = next(T.search('obama'))
+    url = 'https://twitter.com/{}/status/{}'.format(t['user']['screen_name'], t['id_str'])
+    tweet_json = T.oembed(url)
+    assert url == tweet_json['url']
+
+
+def test_oembed_params():
+    t = next(T.search('obama'))
+    url = 'https://twitter.com/{}/status/{}'.format(t['user']['screen_name'], t['id_str'])
+    tweet_json = T.oembed(url, theme="dark")
+    assert 'data-theme="dark"' in tweet_json['html']
 
 
 def test_replies():
@@ -578,3 +585,7 @@ def test_invalid_credentials():
         T.validate_keys()
 
     T.consumer_key = old_consumer_key
+
+
+
+

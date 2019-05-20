@@ -8,7 +8,7 @@ twarc
 twarc is a command line tool and Python library for archiving Twitter JSON data.
 Each tweet is represented as a JSON object that is
 [exactly](https://dev.twitter.com/overview/api/tweets) what was returned from
-the Twitter API.  Tweets are stored as [line-oriented JSON](https://en.wikipedia.org/wiki/JSON_Streaming#Line_delimited_JSON).  Twarc will handle
+the Twitter API.  Tweets are stored as [line-oriented JSON](https://en.wikipedia.org/wiki/JSON_Streaming#Line-delimited_JSON).  Twarc will handle
 Twitter API's [rate limits](https://dev.twitter.com/rest/public/rate-limiting)
 for you. In addition to letting you collect tweets Twarc can also help you
 collect users, trends and hydrate tweet ids.
@@ -26,6 +26,14 @@ in hand you are ready to start using twarc.
 
 1. install [Python](http://python.org/download) (2 or 3)
 2. [pip](https://pip.pypa.io/en/stable/installing/) install twarc
+
+### Homebrew (macOS only)
+
+For macOS users, you can install `twarc` via:
+
+```bash
+$ brew install twarc
+```
 
 ## Quickstart:
 

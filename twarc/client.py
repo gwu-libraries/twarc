@@ -8,6 +8,10 @@ import types
 import logging
 import requests
 
+import ssl
+from requests.exceptions import ConnectionError
+from requests.packages.urllib3.exceptions import ProtocolError
+
 from .decorators import *
 from requests_oauthlib import OAuth1, OAuth1Session
 
@@ -24,6 +28,8 @@ else:
     str_type = str
     import configparser
     from urllib.parse import parse_qs
+
+log = logging.getLogger('twarc')
 
 
 class Twarc(object):
@@ -108,7 +114,7 @@ class Twarc(object):
             statuses = resp.json()["statuses"]
 
             if len(statuses) == 0:
-                logging.info("no new tweets matching %s", params)
+                log.info("no new tweets matching %s", params)
                 break
 
             for status in statuses:
@@ -120,11 +126,11 @@ class Twarc(object):
                 yield status
 
             if reached_end:
-                logging.info("no new tweets matching %s", params)
+                log.info("no new tweets matching %s", params)
                 break
 
             if max_pages is not None and retrieved_pages == max_pages:
-                logging.info("reached max page limit for %s", params)
+                log.info("reached max page limit for %s", params)
                 break
 
             max_id = str(int(status["id_str"]) - 1)
@@ -139,16 +145,19 @@ class Twarc(object):
 
         if user_id and screen_name:
             raise ValueError('only user_id or screen_name may be passed')
-        elif not (user_id or screen_name):
-            raise ValueError('one of user_id or screen_name must be passed')
 
         # Strip if screen_name is prefixed with '@'
         if screen_name:
             screen_name = screen_name.lstrip('@')
         id = screen_name or str(user_id)
         id_type = "screen_name" if screen_name else "user_id"
-        logging.info("starting user timeline for user %s", id)
-        url = "https://api.twitter.com/1.1/statuses/user_timeline.json"
+        log.info("starting user timeline for user %s", id)
+
+        if screen_name or user_id:
+            url = "https://api.twitter.com/1.1/statuses/user_timeline.json"
+        else:
+            url = "https://api.twitter.com/1.1/statuses/home_timeline.json"
+
         params = {"count": 200, id_type: id, "include_ext_alt_text": "true"}
 
         retrieved_pages = 0
@@ -167,14 +176,17 @@ class Twarc(object):
                 retrieved_pages += 1
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 404:
-                    logging.info("no timeline available for %s", id)
+                    log.warn("no timeline available for %s", id)
+                    break
+                elif e.response.status_code == 401:
+                    log.warn("protected account %s", id)
                     break
                 raise e
 
             statuses = resp.json()
 
             if len(statuses) == 0:
-                logging.info("no new tweets matching %s", params)
+                log.info("no new tweets matching %s", params)
                 break
 
             for status in statuses:
@@ -189,11 +201,11 @@ class Twarc(object):
                     yield status
 
             if reached_end:
-                logging.info("no new tweets matching %s", params)
+                log.info("no new tweets matching %s", params)
                 break
 
             if max_pages is not None and retrieved_pages == max_pages:
-                logging.info("reached max page limit for %s", params)
+                log.info("reached max page limit for %s", params)
                 break
 
             max_id = str(int(status["id_str"]) - 1)
@@ -209,7 +221,7 @@ class Twarc(object):
             raise RuntimeError("id_type must be user_id or screen_name")
 
         if not isinstance(ids, types.GeneratorType):
-            iterator = iter(ids)
+            ids = iter(ids)
 
         # TODO: this is similar to hydrate, maybe they could share code?
 
@@ -217,18 +229,18 @@ class Twarc(object):
 
         def do_lookup():
             ids_str = ",".join(lookup_ids)
-            logging.info("looking up users %s", ids_str)
+            log.info("looking up users %s", ids_str)
             url = 'https://api.twitter.com/1.1/users/lookup.json'
             params = {id_type: ids_str}
             try:
                 resp = self.get(url, params=params, allow_404=True)
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 404:
-                    logging.warn("no users matching %s", ids_str)
+                    log.warning("no users matching %s", ids_str)
                 raise e
             return resp.json()
 
-        for id in iterator:
+        for id in ids:
             lookup_ids.append(id.strip())
             if len(lookup_ids) == 100:
                 for u in do_lookup():
@@ -248,7 +260,7 @@ class Twarc(object):
         user = user.lstrip('@')
         url = 'https://api.twitter.com/1.1/followers/ids.json'
 
-        if re.match('^\d+$', user):
+        if re.match(r'^\d+$', user):
             params = {'user_id': user, 'cursor': -1}
         else:
             params = {'screen_name': user, 'cursor': -1}
@@ -258,7 +270,7 @@ class Twarc(object):
                 resp = self.get(url, params=params, allow_404=True)
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 404:
-                    logging.info("no users matching %s", screen_name)
+                    log.info("no users matching %s", screen_name)
                 raise e
             user_ids = resp.json()
             for user_id in user_ids['ids']:
@@ -274,7 +286,7 @@ class Twarc(object):
         user = user.lstrip('@')
         url = 'https://api.twitter.com/1.1/friends/ids.json'
 
-        if re.match('^\d+$', user):
+        if re.match(r'^\d+$', user):
             params = {'user_id': user, 'cursor': -1}
         else:
             params = {'screen_name': user, 'cursor': -1}
@@ -284,7 +296,7 @@ class Twarc(object):
                 resp = self.get(url, params=params, allow_404=True)
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 404:
-                    logging.error("no users matching %s", user)
+                    log.error("no users matching %s", user)
                 raise e
 
             user_ids = resp.json()
@@ -322,47 +334,47 @@ class Twarc(object):
         errors = 0
         while True:
             try:
-                logging.info("connecting to filter stream for %s", params)
+                log.info("connecting to filter stream for %s", params)
                 resp = self.post(url, params, headers=headers, stream=True)
                 errors = 0
                 for line in resp.iter_lines(chunk_size=1024):
                     if event and event.is_set():
-                        logging.info("stopping filter")
+                        log.info("stopping filter")
                         # Explicitly close response
                         resp.close()
                         return
                     if not line:
-                        logging.info("keep-alive")
+                        log.info("keep-alive")
                         if record_keepalive:
                             yield "keep-alive"
                         continue
                     try:
                         yield json.loads(line.decode())
                     except Exception as e:
-                        logging.error("json parse error: %s - %s", e, line)
+                        log.error("json parse error: %s - %s", e, line)
             except requests.exceptions.HTTPError as e:
                 errors += 1
-                logging.error("caught http error %s on %s try", e, errors)
+                log.error("caught http error %s on %s try", e, errors)
                 if self.http_errors and errors == self.http_errors:
-                    logging.warn("too many errors")
+                    log.warning("too many errors")
                     raise e
                 if e.response.status_code == 420:
                     if interruptible_sleep(errors * 60, event):
-                        logging.info("stopping filter")
+                        log.info("stopping filter")
                         return
                 else:
                     if interruptible_sleep(errors * 5, event):
-                        logging.info("stopping filter")
+                        log.info("stopping filter")
                         return
             except Exception as e:
                 errors += 1
-                logging.error("caught exception %s on %s try", e, errors)
+                log.error("caught exception %s on %s try", e, errors)
                 if self.http_errors and errors == self.http_errors:
-                    logging.warn("too many exceptions")
+                    log.warning("too many exceptions")
                     raise e
-                logging.error(e)
+                log.error(e)
                 if interruptible_sleep(errors, event):
-                    logging.info("stopping filter")
+                    log.info("stopping filter")
                     return
 
     def sample(self, event=None, record_keepalive=False):
@@ -380,47 +392,47 @@ class Twarc(object):
         errors = 0
         while True:
             try:
-                logging.info("connecting to sample stream")
+                log.info("connecting to sample stream")
                 resp = self.post(url, params, headers=headers, stream=True)
                 errors = 0
                 for line in resp.iter_lines(chunk_size=512):
                     if event and event.is_set():
-                        logging.info("stopping sample")
+                        log.info("stopping sample")
                         # Explicitly close response
                         resp.close()
                         return
                     if line == "":
-                        logging.info("keep-alive")
+                        log.info("keep-alive")
                         if record_keepalive:
                             yield "keep-alive"
                         continue
                     try:
                         yield json.loads(line.decode())
                     except Exception as e:
-                        logging.error("json parse error: %s - %s", e, line)
+                        log.error("json parse error: %s - %s", e, line)
             except requests.exceptions.HTTPError as e:
                 errors += 1
-                logging.error("caught http error %s on %s try", e, errors)
+                log.error("caught http error %s on %s try", e, errors)
                 if self.http_errors and errors == self.http_errors:
-                    logging.warn("too many errors")
+                    log.warning("too many errors")
                     raise e
                 if e.response.status_code == 420:
                     if interruptible_sleep(errors * 60, event):
-                        logging.info("stopping filter")
+                        log.info("stopping filter")
                         return
                 else:
                     if interruptible_sleep(errors * 5, event):
-                        logging.info("stopping filter")
+                        log.info("stopping filter")
                         return
 
             except Exception as e:
                 errors += 1
-                logging.error("caught exception %s on %s try", e, errors)
+                log.error("caught exception %s on %s try", e, errors)
                 if self.http_errors and errors == self.http_errors:
-                    logging.warn("too many errors")
+                    log.warning("too many errors")
                     raise e
                 if interruptible_sleep(errors, event):
-                    logging.info("stopping filter")
+                    log.info("stopping filter")
                     return
 
     def dehydrate(self, iterator):
@@ -432,7 +444,7 @@ class Twarc(object):
             try:
                 yield json.loads(line)['id_str']
             except Exception as e:
-                logging.error("uhoh: %s\n" % e)
+                log.error("uhoh: %s\n" % e)
 
     def hydrate(self, iterator):
         """
@@ -448,7 +460,7 @@ class Twarc(object):
             tweet_id = tweet_id.strip()  # remove new line if present
             ids.append(tweet_id)
             if len(ids) == 100:
-                logging.info("hydrating %s ids", len(ids))
+                log.info("hydrating %s ids", len(ids))
                 resp = self.post(url, data={
                     "id": ','.join(ids),
                     "include_ext_alt_text": 'true'
@@ -461,7 +473,7 @@ class Twarc(object):
 
         # hydrate any remaining ones
         if len(ids) > 0:
-            logging.info("hydrating %s", ids)
+            log.info("hydrating %s", ids)
             resp = self.post(url, data={
                 "id": ','.join(ids),
                 "include_ext_alt_text": 'true'
@@ -480,7 +492,7 @@ class Twarc(object):
         Retrieves up to the last 100 retweets for the provided
         tweet.
         """
-        logging.info("retrieving retweets of %s", tweet_id)
+        log.info("retrieving retweets of %s", tweet_id)
         url = "https://api.twitter.com/1.1/statuses/retweets/""{}.json".format(
                 tweet_id)
 
@@ -513,7 +525,7 @@ class Twarc(object):
             resp = self.get(url, params=params, allow_404=True)
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 404:
-                logging.info("no region matching WOEID %s", woeid)
+                log.info("no region matching WOEID %s", woeid)
             raise e
         return resp.json()
 
@@ -545,17 +557,17 @@ class Twarc(object):
         # get replies to the tweet
         screen_name = tweet['user']['screen_name']
         tweet_id = tweet['id_str']
-        logging.info("looking for replies to: %s", tweet_id)
+        log.info("looking for replies to: %s", tweet_id)
         for reply in self.search("to:%s" % screen_name, since_id=tweet_id):
 
             if reply['in_reply_to_status_id_str'] != tweet_id:
                 continue
 
             if reply['id_str'] in prune:
-                logging.info("ignoring pruned tweet id %s", reply['id_str'])
+                log.info("ignoring pruned tweet id %s", reply['id_str'])
                 continue
 
-            logging.info("found reply: %s", reply["id_str"])
+            log.info("found reply: %s", reply["id_str"])
 
             if recursive:
                 if reply['id_str'] not in prune:
@@ -569,11 +581,11 @@ class Twarc(object):
         # get other potential replies to it
 
         reply_to_id = tweet.get('in_reply_to_status_id_str')
-        logging.info("prune=%s", prune)
+        log.info("prune=%s", prune)
         if recursive and reply_to_id and reply_to_id not in prune:
             t = self.tweet(reply_to_id)
             if t:
-                logging.info("found reply-to: %s", t['id_str'])
+                log.info("found reply-to: %s", t['id_str'])
                 prune = prune + (tweet['id_str'],)
                 for r in self.replies(t, recursive=True, prune=prune):
                     yield r
@@ -585,7 +597,7 @@ class Twarc(object):
         if recursive and quote_id and quote_id not in prune:
             t = self.tweet(quote_id)
             if t:
-                logging.info("found quote: %s", t['id_str'])
+                log.info("found quote: %s", t['id_str'])
                 prune = prune + (tweet['id_str'],)
                 for r in self.replies(t, recursive=True, prune=prune):
                     yield r
@@ -613,13 +625,30 @@ class Twarc(object):
                 resp = self.get(url, params=params, allow_404=True)
             except requests.exceptions.HTTPError as e:
                 if e.response.status_code == 404:
-                    logging.error("no matching list")
+                    log.error("no matching list")
                 raise e
 
             users = resp.json()
             for user in users['users']:
                 yield user
             params['cursor'] = users['next_cursor']
+
+    def oembed(self, tweet_url, **params):
+        """
+        Returns the oEmbed JSON for a tweet. The JSON includes an html
+        key that contains the HTML for the embed. You can pass in 
+        parameters that correspond to the paramters that Twitter's
+        statuses/oembed endpoint supports. For example:
+
+        o = client.oembed('https://twitter.com/biz/status/21', theme='dark')
+        """
+        log.info("generating embedding for tweet %s", tweet_url)
+        url = "https://publish.twitter.com/oembed"
+
+        params['url'] = tweet_url
+        resp = self.get(url, params=params)
+
+        return resp.json()
 
     @rate_limit
     @catch_conn_reset
@@ -638,23 +667,23 @@ class Twarc(object):
         allow_404 = kwargs.pop('allow_404', False)
         connection_error_count = kwargs.pop('connection_error_count', 0)
         try:
-            logging.info("getting %s %s", args, kwargs)
+            log.info("getting %s %s", args, kwargs)
             r = self.last_response = self.client.get(*args, timeout=(3.05, 31),
                                                      **kwargs)
             # this has been noticed, believe it or not
             # https://github.com/edsu/twarc/issues/75
             if r.status_code == 404 and not allow_404:
-                logging.warn("404 from Twitter API! trying again")
+                log.warning("404 from Twitter API! trying again")
                 time.sleep(1)
                 r = self.get(*args, **kwargs)
             return r
-        except requests.exceptions.ConnectionError as e:
+        except (ssl.SSLError, ConnectionError, ProtocolError) as e:
             connection_error_count += 1
-            logging.error("caught connection error %s on %s try", e,
+            log.error("caught connection error %s on %s try", e,
                           connection_error_count)
             if (self.connection_errors and
                     connection_error_count == self.connection_errors):
-                logging.error("received too many connection errors")
+                log.error("received too many connection errors")
                 raise e
             else:
                 self.connect()
@@ -675,17 +704,17 @@ class Twarc(object):
 
         connection_error_count = kwargs.pop('connection_error_count', 0)
         try:
-            logging.info("posting %s %s", args, kwargs)
+            log.info("posting %s %s", args, kwargs)
             self.last_response = self.client.post(*args, timeout=(3.05, 31),
                                                   **kwargs)
             return self.last_response
-        except requests.exceptions.ConnectionError as e:
+        except (ssl.SSLError, ConnectionError, ProtocolError) as e:
             connection_error_count += 1
-            logging.error("caught connection error %s on %s try", e,
+            log.error("caught connection error %s on %s try", e,
                           connection_error_count)
             if (self.connection_errors and
                     connection_error_count == self.connection_errors):
-                logging.error("received too many connection errors")
+                log.error("received too many connection errors")
                 raise e
             else:
                 self.connect()
@@ -702,12 +731,12 @@ class Twarc(object):
             raise RuntimeError("MissingKeys")
 
         if self.client:
-            logging.info("closing existing http session")
+            log.info("closing existing http session")
             self.client.close()
         if self.last_response:
-            logging.info("closing last response")
+            log.info("closing last response")
             self.last_response.close()
-        logging.info("creating http session")
+        log.info("creating http session")
 
         self.client = OAuth1Session(
             client_key=self.consumer_key,
@@ -764,7 +793,7 @@ class Twarc(object):
     def load_config(self):
         path = self.config
         profile = self.profile
-        logging.info("loading %s profile from config %s", profile, path)
+        log.info("loading %s profile from config %s", profile, path)
 
         if not path or not os.path.isfile(path):
             return {}
